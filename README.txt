@@ -34,7 +34,7 @@ run a tiny local server in the folder instead, e.g.:
 
 First load
 ----------
-The OCR engine and its English language data are about 17 MB, served
+The OCR engine and its English language data are about 20 MB, served
 from this folder. The browser downloads them the first time someone
 presses "Detect languages" and caches them afterwards. Nothing is
 fetched from the internet at any point.
@@ -42,16 +42,25 @@ fetched from the internet at any point.
 
 How the language detection works
 --------------------------------
-The page crops the top third of each image, raises the contrast so
-white headline text becomes black on white, and runs OCR on it. It
-then scores the words against the market languages — distinctive words
-first ("ontdek", "upptäck", "zachyťte"), then accented characters
-(ñ, ł, ř, ã, ß, å). A confident match fills the code in; anything
-uncertain is flagged so you can fix it with "Assign by hand".
+The page crops the top third of each image, upscales it, and runs OCR on
+it. It then identifies the language with two statistical n-gram models
+(franc and tinyld) restricted to your market list. Two batch-level tricks
+make this reliable on headlines only a few words long:
 
-Accuracy depends on the headline being large and legible, which it is
-in these templates. Always glance at the reading it shows next to each
-file before downloading.
+  - Words appearing in most images of the batch are the campaign name
+    ("Singles' Day"), not a language signal, so they are removed first.
+  - A campaign set carries one image per market, so when there are no
+    more images than market codes, each code is assigned once. This
+    settles near-ties: if one image is confidently Spanish, another
+    ambiguous one is no longer competing for it.
+
+Anything the page is not confident about is flagged, and the text it read
+is shown beside each file. Always glance at those readings before
+downloading.
+
+Note on translation: the page identifies the language but does not
+translate. Offline translation would need a model far larger than the
+whole site, so it is not practical here.
 
 
 Changing the market list
@@ -74,7 +83,8 @@ Folder contents
   vendor/worker.min.js        its background worker
   vendor/core/                the OCR engine (WebAssembly)
   vendor/jszip.min.js         ZIP packing
-  tessdata/eng.traineddata.gz the OCR language model
+  vendor/langid.js            language identification models
+  tessdata/eng.traineddata    the OCR language model
 
 Licences: Tesseract.js and JSZip are open source (Apache-2.0 and
 MIT/GPL respectively); their licence files ship inside the minified

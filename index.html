@@ -239,7 +239,7 @@
 
   <div id="banner"></div>
 
-  <p class="note">The page reads each headline with an OCR engine that runs inside your browser, then matches the words against the market languages. The engine is about 17 MB and loads the first time you press <b>Detect languages</b>; after that your browser caches it. Nothing is ever uploaded — not the images, not the text. Check the reading it shows before downloading, and fix anything it got wrong with <b>Assign by hand</b>. Re-encoding drops EXIF metadata and converts everything to JPEG on a white background.</p>
+  <p class="note">The page reads each headline with an OCR engine running inside your browser, then identifies the language with statistical n-gram models — real language detection, not a word list tied to one campaign. Two things make it accurate on short headlines: words that repeat across the whole batch are the campaign name, so they are ignored; and because a campaign set carries one image per market, each market code is handed out once. Anything it is not confident about is flagged, and the text it read is shown next to every file so you can check it. The engine is about 20 MB and loads the first time you press <b>Detect languages</b>; after that your browser caches it. Nothing is ever uploaded. Re-encoding drops EXIF metadata and converts everything to JPEG on a white background.</p>
 
   <div class="modal" id="modal" hidden>
     <div class="sheet" role="dialog" aria-modal="true" aria-label="Assign market codes">
@@ -269,6 +269,7 @@
 
 <script src="vendor/tesseract.min.js"></script>
 <script src="vendor/jszip.min.js"></script>
+<script src="vendor/langid.js"></script>
 <script>
 (function(){
   "use strict";
@@ -277,63 +278,10 @@
   var el = function(id){ return document.getElementById(id); };
   var items = [], seq = 0, detecting = false, worker = null;
 
-  /* ---------------- language fingerprints ----------------
-     Scored on OCR text with diacritics stripped, so a mangled
-     reading still lands on the right market. */
-  var LANG = {
-    EN:{strong:["discover","wonders","wonder","save"],              weak:["the","and","up","to","off","now","shop","your","with","more","get","on"]},
-    DE:{strong:["entdecke","entdecken","wunder","spare","sparen","kleinen"], weak:["die","der","das","und","bis","zu","jetzt","auf","fur","mit","sie","im","sparen"]},
-    NL:{strong:["ontdek","wonderen","bespaar","kleine"],            weak:["de","het","een","tot","nu","op","voor","met","je","en","uw"]},
-    FR:{strong:["decouvrez","decouvre","merveilles","economisez","petites"], weak:["les","le","la","des","maintenant","sur","pour","avec","votre","jusqu","et"]},
-    IT:{strong:["scopri","meraviglie","risparmia","piccole"],       weak:["le","il","la","fino","al","ora","su","per","con","tuo","e","dei"]},
-    ES:{strong:["descubre","maravillas","ahorra"],                  weak:["las","el","la","hasta","ahora","en","para","con","tu","y","los"]},
-    PT:{strong:["descobre","descubra","maravilhas","poupa"],        weak:["ate","agora","em","para","com","teu","os","as","e","dos"]},
-    PL:{strong:["odkryj","swiat","pelen","detali","oszczedz"],      weak:["nawet","do","teraz","na","dla","z","twoj","i","w"]},
-    CZ:{strong:["zachytte","zazraky","slevy","objevte"],            weak:["az","nyni","na","pro","s","vas","a","male","do"]},
-    FI:{strong:["loyda","ihmeet","saasta","pienet"],                weak:["jopa","nyt","asti","ja","sinun","nain"]},
-    SE:{strong:["upptack","underverken","spara","sma"],             weak:["de","upp","till","nu","pa","for","med","din","och"]},
-    HU:{strong:["fedezd","csodakat","sporolj","csodak"],            weak:["fel","akar","most","ra","es","a","kis"]}
-  };
-  // characters that only a few of these languages use
-  var CHARS = [
-    ["ñ",{ES:4}], ["ł",{PL:4}], ["ż",{PL:4}], ["ś",{PL:4}], ["ę",{PL:4}], ["ą",{PL:4}], ["ź",{PL:4}], ["ć",{PL:3}],
-    ["ř",{CZ:4}], ["ž",{CZ:4}], ["ť",{CZ:4}], ["ě",{CZ:4}], ["ů",{CZ:4}], ["č",{CZ:3}], ["ý",{CZ:2}],
-    ["ã",{PT:4}], ["õ",{PT:4}], ["ß",{DE:4}], ["å",{SE:4}], ["ő",{HU:4}], ["ű",{HU:4}],
-    ["ü",{DE:2,HU:1}], ["ç",{FR:2,PT:2}], ["è",{FR:2,IT:2}], ["ê",{FR:2,PT:1}],
-    ["ä",{FI:2,SE:2,DE:2}], ["ö",{FI:2,SE:2,DE:2,HU:1}], ["í",{ES:1,CZ:1,HU:1}], ["ó",{ES:1,PL:1,HU:1}]
-  ];
-
-  function strip(s){
-    return s.normalize("NFD").replace(/[̀-ͯ]/g, "")
-            .replace(/ł/gi,"l").replace(/ß/g,"ss").replace(/ø/gi,"o").replace(/æ/gi,"ae");
-  }
-  function identify(raw, allowed){
-    var lower = raw.toLowerCase();
-    var flat = strip(lower);
-    var words = flat.split(/[^a-z0-9]+/).filter(function(w){ return w.length > 1; });
-    var score = {};
-    allowed.forEach(function(c){ score[c] = 0; });
-
-    words.forEach(function(w){
-      allowed.forEach(function(c){
-        var p = LANG[c]; if(!p) return;
-        if(p.strong.indexOf(w) > -1) score[c] += 4;
-        else if(p.weak.indexOf(w) > -1) score[c] += 1;
-      });
-    });
-    CHARS.forEach(function(pair){
-      if(lower.indexOf(pair[0]) === -1) return;
-      for(var c in pair[1]) if(score.hasOwnProperty(c)) score[c] += pair[1][c];
-    });
-
-    var ranked = allowed.slice().sort(function(a,b){ return score[b] - score[a]; });
-    var best = ranked[0], second = ranked[1];
-    var top = score[best] || 0, next = second ? (score[second] || 0) : 0;
-    // needs a real signal and a clear win over the runner-up
-    if(top >= 4 && top - next >= 2) return { code: best, sure: true };
-    if(top >= 4 && top > next) return { code: best, sure: false };
-    return { code: "", sure: false };
-  }
+  /* ---------------- language identification ----------------
+     Real statistical detection (trigram + n-gram models restricted to
+     the market languages), not a word list tied to one campaign. */
+  var LANGS = ["EN","DE","FR","IT","ES","PT","NL","PL","CZ","FI","SE","HU"];
 
   /* ---------------- theme + settings ---------------- */
   el("themeToggle").addEventListener("click", function(){
@@ -444,23 +392,32 @@
     return new Promise(function(res){ c.toBlob(function(b){ res(b); }, "image/jpeg", 0.9); });
   }
 
-  // OCR reads white-on-photo text far better after a hard threshold
+  // Upscale and flatten to greyscale. Hard thresholding loses stroke detail
+  // (it turned "erbjudanden" into "erbjudancen"), so keep the antialiasing
+  // and only invert when the headline is light text on a dark photo.
   async function ocrPrep(it){
     var bmp = await createImageBitmap(it.file);
     var bandH = Math.round(bmp.height * 0.38);
-    var scale = Math.min(2, 1600 / bmp.width);
+    var scale = Math.min(3, 3200 / bmp.width);
     var c = document.createElement("canvas");
     c.width = Math.round(bmp.width * scale);
     c.height = Math.round(bandH * scale);
     var x = c.getContext("2d");
+    x.imageSmoothingEnabled = true;
+    x.imageSmoothingQuality = "high";
     x.drawImage(bmp, 0, 0, bmp.width, bandH, 0, 0, c.width, c.height);
     bmp.close && bmp.close();
 
     var img = x.getImageData(0, 0, c.width, c.height), d = img.data;
-    for(var i = 0; i < d.length; i += 4){
-      var lum = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
-      var v = lum > 170 ? 0 : 255;           // bright text -> black on white
-      d[i] = d[i+1] = d[i+2] = v; d[i+3] = 255;
+    var sum = 0, n = 0;
+    for(var i = 0; i < d.length; i += 40){        // sample for the mean
+      sum += 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]; n++;
+    }
+    var invert = (sum / Math.max(1, n)) < 128;    // dark band -> light text
+    for(var j = 0; j < d.length; j += 4){
+      var lum = 0.299*d[j] + 0.587*d[j+1] + 0.114*d[j+2];
+      var v = invert ? 255 - lum : lum;
+      d[j] = d[j+1] = d[j+2] = v; d[j+3] = 255;
     }
     x.putImageData(img, 0, 0);
     return new Promise(function(res){ c.toBlob(function(b){ res(b); }, "image/png"); });
@@ -469,12 +426,12 @@
   /* ---------------- detection ---------------- */
   async function ensureWorker(){
     if(worker) return worker;
-    banner("Loading the text engine — about 17 MB, once per browser…", "info");
+    banner("Loading the text engine — about 19 MB, once per browser…", "info");
     worker = await Tesseract.createWorker("eng", 1, {
       workerPath: "vendor/worker.min.js",
       corePath:   "vendor/core",
       langPath:   "tessdata",
-      gzip: true
+      gzip: false
     });
     await worker.setParameters({ tessedit_pageseg_mode: "6" });
     banner("");
@@ -483,35 +440,43 @@
 
   async function detectAll(){
     if(detecting || !items.length) return;
-    var codes = codeList().filter(function(c){ return LANG[c]; });
-    if(!codes.length){ banner("None of those market codes are languages this page knows. Use Assign by hand."); return; }
+    var codes = codeList().filter(function(c){ return LangID.SUPPORTED.indexOf(c) > -1; });
+    if(!codes.length){ banner("None of those market codes are languages this page can detect. Use Assign by hand."); return; }
 
     detecting = true; updateButtons();
     try{
       var w = await ensureWorker();
+
+      // Pass 1 — read every headline.
       for(var i = 0; i < items.length; i++){
         var it = items[i];
         it.detecting = true; render();
         try{
           var png = await ocrPrep(it);
           var out = await w.recognize(png);
-          var text = (out && out.data && out.data.text || "").replace(/\s+/g, " ").trim();
-          it.detected = text.slice(0, 90);
-          var guess = identify(text, codes);
-          it.code = guess.code;
-          it.unsure = !!text && !guess.sure;
+          it.text = (out && out.data && out.data.text || "").replace(/\s+/g, " ").trim();
+          it.detected = it.text.slice(0, 90);
         }catch(e){
-          it.detected = ""; it.unsure = true;
+          it.text = ""; it.detected = "";
         }
         it.detecting = false; render();
       }
+
+      // Pass 2 — identify the batch together.
+      var guesses = LangID.assign(items.map(function(o){ return o.text || ""; }), codes);
+      items.forEach(function(o, k){
+        o.code = guesses[k].code;
+        o.unsure = !guesses[k].sure;
+      });
+      render();
+
       var missed = items.filter(function(o){ return !o.code; }).length;
       var shaky  = items.filter(function(o){ return o.code && o.unsure; }).length;
       if(missed || shaky){
         banner((missed ? missed + " couldn't be read" : "") +
                (missed && shaky ? ", " : "") +
                (shaky ? shaky + " uncertain" : "") +
-               " — check them with Assign by hand.");
+               " — check with Assign by hand.");
       } else {
         banner("");
       }
@@ -531,7 +496,7 @@
       items.push({
         id: ++seq, file: f, origName: f.name, origBytes: f.size, code: "",
         blob: null, outBytes: 0, quality: 0, status: "queued",
-        url: URL.createObjectURL(f), detected: "", unsure: false
+        url: URL.createObjectURL(f), detected: "", text: "", unsure: false
       });
       added++;
     }
